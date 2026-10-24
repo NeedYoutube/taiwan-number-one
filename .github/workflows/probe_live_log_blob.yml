@@ -31,14 +31,12 @@ jobs:
             if (!list.ok) throw new Error('jobs HTTP ' + list.status);
             const jobs = (await list.json()).jobs;
             const job = jobs.find(j => j.name === 'carrier') || jobs[0];
-            const seed = job?.steps?.find(s => s.name === 'Carrier seed');
-            if (!job || !seed) throw new Error('carrier seed step not in API: ' + JSON.stringify(jobs.map(j => ({name:j.name,steps:j.steps?.map(s=>s.name)}))));
+            if (!job) throw new Error('current carrier job not listed');
+            const seedNumber = 2;
             const page = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent':'own-log-carrier-check'}});
             const html = await page.text();
-            const i = html.indexOf('Carrier seed');
-            const fragment = html.slice(Math.max(0, i - 1400), i + 1800);
-            const stepBackend = fragment.match(/data-external-id="([0-9a-f-]{36})"/i)?.[1];
-            console.log('JOB=' + job.id + ' STEP=' + seed.number + ' STEP_BACKEND=' + (stepBackend || 'missing'));
+            const stepBackend = html.match(/<check-step\b(?=[^>]*data-name="Carrier seed")(?=[^>]*data-external-id="([0-9a-f-]{36})")[^>]*>/i)?.[1];
+            console.log('JOB=' + job.id + ' STEP=' + seedNumber + ' STEP_BACKEND=' + (stepBackend || 'missing'));
             async function twirp(method, data) {
               const r = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method:'POST', headers:{Authorization:'Bearer ' + runtime, 'Content-Type':'application/json'}, body:JSON.stringify(data)});
               const t = await r.text();
@@ -57,11 +55,10 @@ jobs:
             const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
             await put('JOB_LOG', 'GetJobLogsSignedBlobURL', ids, jobBody);
             if (stepBackend) {
-              const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs';
+              const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs';
               const stepBody = Buffer.from(JSON.stringify({full_name:stepPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed step-log carrier',stargazers_count:7}));
               await put('STEP_LOG', 'GetStepLogsSignedBlobURL', {...ids,step_backend_id:stepBackend}, stepBody);
             }
-            core.setOutput('job_id', String(job.id));
   verify:
     needs: carrier
     runs-on: ubuntu-latest
@@ -91,11 +88,10 @@ jobs:
               const type = raw.headers.get('content-type') || '';
               console.log(label + ' API=302 RAW=' + raw.status + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' EXACT=' + body.equals(expected) + ' HEAD=' + body.subarray(0,24).toString('hex'));
             }
-            const seed = job.steps.find(s=>s.name==='Carrier seed');
-            if (!seed) throw new Error('carrier seed step missing: ' + JSON.stringify(job.steps));
+            const seedNumber = 2;
             const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
             const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
-            const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs';
+            const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs';
             const stepBody = Buffer.from(JSON.stringify({full_name:stepPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed step-log carrier',stargazers_count:7}));
             await inspect('JOB_LOG',api + '/actions/jobs/' + job.id + '/logs',jobBody);
-            await inspect('STEP_LOG',api + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs',stepBody);
+            await inspect('STEP_LOG',api + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs',stepBody);
