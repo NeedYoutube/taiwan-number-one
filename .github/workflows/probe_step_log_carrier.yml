@@ -36,14 +36,23 @@ jobs:
             if (!jobsResponse.ok) throw new Error('list jobs HTTP ' + jobsResponse.status);
             const jobs = (await jobsResponse.json()).jobs;
             const job = jobs.find(x => x.name === 'carrier');
-            const step = job && job.steps.find(x => x.name === 'Carrier target');
-            if (!job || !step) throw new Error('carrier target step missing');
-            const jobPage = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent': 'own-step-log-probe'}});
-            const html = await jobPage.text();
-            const match = /data-name="Carrier target"[\s\S]{0,1800}?data-external-id="([0-9a-f-]{36})"/i.exec(html);
-            if (!match) throw new Error('carrier step backend ID not found in public job page');
-            const identity = {...ids, step_backend_id: match[1]};
-            const payload = Buffer.from(JSON.stringify({full_name: 'x/../' + repo + '/actions/jobs/' + job.id + '/steps/' + step.number + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'controlled step-log test', stargazers_count: 7}));
+            if (!job) throw new Error('carrier job missing');
+            let target = null;
+            for (let attempt = 0; attempt < 40 && !target; attempt++) {
+              const jobPage = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent': 'own-step-log-probe'}});
+              const html = await jobPage.text();
+              for (const item of html.matchAll(/<check-step\s+([\s\S]*?)>/g)) {
+                const attrs = item[1];
+                const name = attrs.match(/data-name="([^"]*)"/)?.[1];
+                const number = attrs.match(/data-number="(\d+)"/)?.[1];
+                const backendId = attrs.match(/data-external-id="([0-9a-f-]{36})"/)?.[1];
+                if (name === 'Carrier target' && number && backendId) target = {number: Number(number), backendId};
+              }
+              if (!target) await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            if (!target) throw new Error('carrier step backend ID not found in public job page');
+            const identity = {...ids, step_backend_id: target.backendId};
+            const payload = Buffer.from(JSON.stringify({full_name: 'x/../' + repo + '/actions/jobs/' + job.id + '/steps/' + target.number + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'controlled step-log test', stargazers_count: 7}));
             async function twirp(method, data) {
               const response = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method: 'POST', headers: {Authorization: 'Bearer ' + runtime, 'Content-Type': 'application/json'}, body: JSON.stringify(data)});
               const text = await response.text();
@@ -64,12 +73,12 @@ jobs:
             }
             const signed = await twirp('GetStepLogsSignedBlobURL', identity);
             const upload = await put(signed.logs_url, payload);
-            console.log('STEP_UPLOAD=' + JSON.stringify({status: upload.status, error: upload.error, type: upload.type, bytes: payload.length, targetStep: step.number}));
+            console.log('STEP_UPLOAD=' + JSON.stringify({status: upload.status, error: upload.error, type: upload.type, bytes: payload.length, targetStep: target.number}));
             if (upload.status !== 201 && upload.status !== 202) throw new Error('step blob upload rejected: ' + upload.body.slice(0, 160));
             const metadata = await twirp('CreateStepLogsMetadata', {...identity, uploaded_at: new Date().toISOString(), line_count: 1});
             console.log('STEP_METADATA=' + JSON.stringify(metadata));
             core.setOutput('job_id', String(job.id));
-            core.setOutput('step_number', String(step.number));
+            core.setOutput('step_number', String(target.number));
   verify:
     needs: carrier
     runs-on: ubuntu-latest
