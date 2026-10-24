@@ -1,0 +1,58 @@
+name: Probe job-name redirect MIME
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  hash_name:
+    name: "probe#api-version=2012-02-12&rsct=application/json"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Repo Cassette job-name redirect probe"
+  nel_name:
+    name: "probe\u0085json"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Repo Cassette NEL job-name probe"
+  inspect:
+    needs: [hash_name, nel_name]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect signed workflow log response metadata
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({owner, repo, run_id: context.runId, per_page: 100});
+            for (const job of jobs.data.jobs.filter(item => item.name.startsWith('probe'))) {
+              const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/actions/jobs/${job.id}/logs`, {
+                headers: {Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: 'application/vnd.github.v3+json', 'User-Agent': 'repo-cassette-own-probe'},
+                redirect: 'manual',
+              });
+              const location = response.headers.get('location');
+              const record = {
+                jobNameUtf8Hex: Buffer.from(job.name, 'utf8').toString('hex'),
+                status: response.status,
+                apiMimeHex: Buffer.from(response.headers.get('content-type') || '', 'latin1').toString('hex'),
+                redirected: Boolean(location),
+              };
+              await response.body?.cancel();
+              if (location) {
+                const url = new URL(location);
+                record.redirectHost = url.host;
+                record.rsct = url.searchParams.get('rsct');
+                record.rscd = url.searchParams.get('rscd');
+                record.queryKeys = [...url.searchParams.keys()];
+                const download = await fetch(location);
+                const reader = download.body?.getReader();
+                const first = reader ? (await reader.read()).value || new Uint8Array() : new Uint8Array();
+                await reader?.cancel();
+                record.downloadStatus = download.status;
+                record.downloadMimeHex = Buffer.from(download.headers.get('content-type') || '', 'latin1').toString('hex');
+                record.first16Hex = Buffer.from(first).subarray(0, 16).toString('hex');
+              }
+              console.log(JSON.stringify(record));
+            }
