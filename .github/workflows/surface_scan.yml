@@ -1,0 +1,98 @@
+name: Repo Cassette GitHub response surface scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe fixed GitHub JSON Accept and final MIME
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const api = 'https://api.github.com';
+            const headers = {
+              Accept: 'application/vnd.github.v3+json',
+              Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            };
+
+            async function readPrefix(response, limit = 524288) {
+              const reader = response.body?.getReader();
+              if (!reader) return Buffer.alloc(0);
+              const chunks = [];
+              let length = 0;
+              while (length < limit) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const bytes = Buffer.from(value);
+                chunks.push(bytes.subarray(0, limit - length));
+                length += bytes.length;
+              }
+              try { await reader.cancel(); } catch {}
+              return Buffer.concat(chunks);
+            }
+
+            async function inspect(label, path) {
+              try {
+                const first = await fetch(`${api}${path}`, { headers, redirect: 'manual' });
+                const location = first.headers.get('location');
+                const final = location && [301, 302, 303, 307, 308].includes(first.status)
+                  ? await fetch(location, { headers: { Accept: headers.Accept }, redirect: 'follow' })
+                  : first;
+                const body = await readPrefix(final);
+                const mime = final.headers.get('content-type') || '';
+                let shape = 'not-json';
+                try {
+                  const value = JSON.parse(body.toString('utf8'));
+                  shape = Array.isArray(value) ? 'array'
+                    : value && typeof value === 'object'
+                      ? `object:${Object.keys(value).slice(0, 8).join('|')}`
+                      : typeof value;
+                } catch {}
+                core.info(`SURFACE ${label} api=${first.status} final=${final.status} mime_latin1_hex=${Buffer.from(mime, 'latin1').toString('hex')} bytes_read=${body.length} prefix_hex=${body.subarray(0, 8).toString('hex')} shape=${shape}`);
+              } catch (error) {
+                core.info(`SURFACE ${label} error=${String(error.message).slice(0, 180)}`);
+              }
+            }
+
+            const paths = [
+              ['symlink_toml', '/repos/npcode/symlink-test/contents/hello.toml'],
+              ['symlink_txt', '/repos/npcode/symlink-test/contents/hello.txt'],
+              ['symlink_target', '/repos/npcode/symlink-test/contents/subdir/hello.toml'],
+              ['asset_base', '/repos/pan-ontologies/PaNET/releases/assets/479097650'],
+              ['asset_zip_suffix', '/repos/pan-ontologies/PaNET/releases/assets/479097650.zip'],
+              ['asset_bin_suffix', '/repos/pan-ontologies/PaNET/releases/assets/479097650.bin'],
+              ['asset_json_suffix', '/repos/pan-ontologies/PaNET/releases/assets/479097650.json'],
+              ['asset_download_suffix', '/repos/pan-ontologies/PaNET/releases/assets/479097650/download'],
+              ['asset_raw_suffix', '/repos/pan-ontologies/PaNET/releases/assets/479097650/raw'],
+            ];
+            for (const [label, path] of paths) await inspect(label, path);
+
+            const report = await fetch(`${api}/repos/octocat/Hello-World/dependency-graph/sbom/generate-report`, { headers });
+            const reportBody = await readPrefix(report, 16384);
+            core.info(`SURFACE sbom_generate status=${report.status} mime_latin1_hex=${Buffer.from(report.headers.get('content-type') || '', 'latin1').toString('hex')}`);
+            if (report.status === 201) {
+              let reportUrl;
+              try { reportUrl = JSON.parse(reportBody.toString('utf8')).sbom_url; } catch {}
+              if (typeof reportUrl === 'string' && reportUrl.startsWith(`${api}/repos/octocat/Hello-World/`)) {
+                const reportPath = new URL(reportUrl).pathname;
+                for (let attempt = 0; attempt < 20; attempt++) {
+                  const check = await fetch(`${api}${reportPath}`, { headers, redirect: 'manual' });
+                  if (check.status === 302) {
+                    await inspect('sbom_fetch', reportPath);
+                    break;
+                  }
+                  if (check.status !== 202) {
+                    core.info(`SURFACE sbom_fetch api=${check.status}`);
+                    break;
+                  }
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+              }
+            }
