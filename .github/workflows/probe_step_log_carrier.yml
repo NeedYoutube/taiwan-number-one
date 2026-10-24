@@ -77,6 +77,16 @@ jobs:
             if (upload.status !== 201 && upload.status !== 202) throw new Error('step blob upload rejected: ' + upload.body.slice(0, 160));
             const metadata = await twirp('CreateStepLogsMetadata', {...identity, uploaded_at: new Date().toISOString(), line_count: 1});
             console.log('STEP_METADATA=' + JSON.stringify(metadata));
+            const liveApi = await fetch(base + '/actions/jobs/' + job.id + '/steps/' + target.number + '/logs', {headers, redirect: 'manual'});
+            if (liveApi.status === 302 && liveApi.headers.get('location')) {
+              const raw = await fetch(liveApi.headers.get('location'));
+              const body = Buffer.from(await raw.arrayBuffer());
+              const type = raw.headers.get('content-type') || '';
+              console.log('STEP_LIVE_RAW=' + JSON.stringify({api: liveApi.status, status: raw.status, type, typeHex: Buffer.from(type, 'latin1').toString('hex'), bytes: body.length, exact: body.equals(payload), head: body.subarray(0, 24).toString('hex')}));
+            } else {
+              const body = await liveApi.text();
+              console.log('STEP_LIVE_API=' + JSON.stringify({status: liveApi.status, type: liveApi.headers.get('content-type'), body: body.slice(0, 300)}));
+            }
             core.setOutput('job_id', String(job.id));
             core.setOutput('step_number', String(target.number));
   verify:
