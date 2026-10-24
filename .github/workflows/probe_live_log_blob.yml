@@ -86,12 +86,15 @@ jobs:
               const raw = await fetch(loc,{redirect:'manual'});
               const body = Buffer.from(await raw.arrayBuffer());
               const type = raw.headers.get('content-type') || '';
-              console.log(label + ' API=302 RAW=' + raw.status + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' EXACT=' + body.equals(expected) + ' HEAD=' + body.subarray(0,24).toString('hex'));
+              const rsct = new URL(loc).searchParams.get('rsct');
+              console.log(label + ' API=302 RAW=' + raw.status + ' RSCT=' + JSON.stringify(rsct) + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' EXACT=' + body.equals(expected));
             }
             const seedNumber = 2;
             const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
             const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
             const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs';
             const stepBody = Buffer.from(JSON.stringify({full_name:stepPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed step-log carrier',stargazers_count:7}));
-            await inspect('JOB_LOG',api + '/actions/jobs/' + job.id + '/logs',jobBody);
+            const logBase = api + '/actions/jobs/' + job.id + '/logs';
+            await inspect('BASE',logBase,jobBody);
+            for (const [label,suffix] of [['RSCT_NEL','?rsct=application%2Fjson%85'],['RSCT_JSON','?rsct=application%2Fjson'],['RESPONSE_TYPE','?response-content-type=application%2Fjson%85'],['CONTENT_TYPE','?content-type=application%2Fjson%85'],['DOWNLOAD','?download=1']]) await inspect(label,logBase + suffix,jobBody);
             await inspect('STEP_LOG',api + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs',stepBody);
