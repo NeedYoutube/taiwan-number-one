@@ -1,0 +1,110 @@
+name: Probe job-log blob properties
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  carrier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ensure log blob has initial content
+        run: echo 'Repo Cassette log-property probe initial line'
+      - name: Inspect signed job-log URL and set MIME
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const {execFileSync} = require('node:child_process');
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            const service = process.env.ACTIONS_RESULTS_URL;
+            if (!token || !service) throw new Error('Results runtime environment unavailable in JavaScript action');
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const scope = String(claims.scp || '').split(' ').find(s => s.startsWith('Actions.Results:'));
+            if (!scope) throw new Error('Actions.Results scope unavailable');
+            const [, workflow_run_backend_id, workflow_job_run_backend_id] = scope.split(':');
+            const endpoint = new URL('twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL', service);
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({workflow_run_backend_id, workflow_job_run_backend_id}),
+            });
+            if (!response.ok) throw new Error(`GetJobLogsSignedBlobURL HTTP ${response.status}`);
+            const signed = await response.json();
+            if (!signed.logs_url) throw new Error('No signed job-log URL');
+            const parsed = new URL(signed.logs_url);
+            console.log(`SIGNED storage=${signed.blob_storage_type} host=${parsed.host} sp=${JSON.stringify(parsed.searchParams.get('sp'))}`);
+            const python = String.raw`
+            import email.utils, http.client, os, time, urllib.parse
+
+            signed = os.environ['SIGNED_LOG_URL']
+            uri = urllib.parse.urlsplit(signed)
+            def request(method, path, headers):
+                conn = http.client.HTTPSConnection(uri.hostname, uri.port or 443, timeout=15)
+                conn.request(method, path, body=b'', headers=headers)
+                response = conn.getresponse()
+                response.read()
+                result = (response.status, response.getheader('x-ms-error-code', ''), response.getheader('content-type', ''))
+                conn.close()
+                return result
+
+            path = uri.path + '?' + uri.query
+            base_headers = {'x-ms-version': '2023-11-03', 'x-ms-date': email.utils.formatdate(usegmt=True)}
+            for label, target, headers in [
+                ('head_before', path, base_headers),
+                ('set_nel', path + '&comp=properties', {**base_headers, 'x-ms-blob-content-type': 'application/json\x85', 'Content-Length': '0'}),
+                ('head_after_nel', path, base_headers),
+            ]:
+                try:
+                    for attempt in range(5 if label == 'set_nel' else 1):
+                        status, code, mime = request('HEAD' if label.startswith('head_') else 'PUT', target, headers)
+                        print(f'BLOB {label} attempt={attempt+1} status={status} error={code!r} mime_hex={mime.encode("latin1", errors="replace").hex()}')
+                        if status not in (404, 409):
+                            break
+                        time.sleep(1)
+                except Exception as error:
+                    print(f'BLOB {label} exception={type(error).__name__}')
+            `;
+            const output = execFileSync('python3', ['-c', python], {
+              env: {...process.env, SIGNED_LOG_URL: signed.logs_url},
+              encoding: 'utf8',
+              timeout: 60000,
+            });
+            process.stdout.write(output);
+  verify:
+    needs: carrier
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check completed carrier log through GitHub REST
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const base = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}`;
+            const headers = {
+              Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: 'application/vnd.github.v3+json',
+              'User-Agent': 'repo-cassette-log-property-probe',
+            };
+            const listed = await fetch(`${base}/actions/runs/${process.env.GITHUB_RUN_ID}/jobs?per_page=100`, {headers});
+            if (!listed.ok) throw new Error(`List jobs HTTP ${listed.status}`);
+            const carrier = (await listed.json()).jobs.find(job => job.name === 'carrier');
+            if (!carrier) throw new Error('Carrier job not found');
+            const api = await fetch(`${base}/actions/jobs/${carrier.id}/logs`, {headers, redirect: 'manual'});
+            const location = api.headers.get('location');
+            console.log(`REST status=${api.status} mime=${JSON.stringify(api.headers.get('content-type'))} redirectHost=${location ? new URL(location).host : ''} redirectRsct=${location ? JSON.stringify(new URL(location).searchParams.get('rsct')) : ''}`);
+            await api.body?.cancel();
+            if (!location) return;
+            const raw = await fetch(location, {headers: {Accept: headers.Accept}, redirect: 'follow'});
+            const mime = raw.headers.get('content-type') || '';
+            const reader = raw.body?.getReader();
+            const first = reader ? (await reader.read()).value || new Uint8Array() : new Uint8Array();
+            await reader?.cancel();
+            console.log(`RAW status=${raw.status} mime=${JSON.stringify(mime)} mimeHex=${Buffer.from(mime, 'latin1').toString('hex')} first16=${Buffer.from(first).subarray(0,16).toString('hex')}`);
