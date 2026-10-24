@@ -66,3 +66,16 @@ jobs:
               const bytes = Buffer.from(await raw.arrayBuffer());
               console.log('JOB_LIVE_RAW=' + JSON.stringify({status: raw.status, type: raw.headers.get('content-type'), bytes: bytes.length, exact: bytes.equals(body), json: (() => {try {JSON.parse(bytes.toString()); return true} catch {return false}})(), prefix: bytes.subarray(0,16).toString('hex')}));
             }
+
+            const logsApi = 'https://api.github.com/repos/' + repo + '/actions/jobs/' + job.id + '/logs';
+            for (const query of ['?rsct=application%2Fjson%85', '?response-content-type=application%2Fjson%85', '?download=1&rsct=application%2Fjson%85', '?rsct=text%2Fplain&rsct=application%2Fjson%85']) {
+              const response = await fetch(logsApi + query, {headers: apiHeaders, redirect: 'manual'});
+              const location = response.headers.get('location');
+              const rsct = location ? new URL(location).searchParams.getAll('rsct').map(x => Buffer.from(x).toString('hex')) : [];
+              console.log('JOB_QUERY=' + JSON.stringify({query, status: response.status, type: response.headers.get('content-type'), rsct}));
+              if (location) {
+                const raw = await fetch(location);
+                const bytes = Buffer.from(await raw.arrayBuffer());
+                console.log('JOB_QUERY_RAW=' + JSON.stringify({query, status: raw.status, type: raw.headers.get('content-type'), bytes: bytes.length, exact: bytes.equals(body)}));
+              } else { await response.body?.cancel(); }
+            }
