@@ -41,14 +41,26 @@ jobs:
             }
             const ids = {workflow_run_backend_id, workflow_job_run_backend_id};
             const signed = await rpc('GetJobLogsSignedBlobURL', ids);
+            const parsed = new URL(signed.logs_url);
+            console.log('JOB_SAS=' + JSON.stringify({sp: parsed.searchParams.get('sp'), rsct: parsed.searchParams.get('rsct')}));
             const put = await fetch(signed.logs_url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/octet-stream', 'x-ms-blob-content-type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body});
             console.log('JOB_PUT=' + put.status + ' BODY=' + body.length + ' JOB=' + job.id);
             await put.arrayBuffer();
             const metadata = await rpc('CreateJobLogsMetadata', {...ids, uploaded_at: new Date().toISOString(), line_count: 1});
             console.log('JOB_METADATA=' + JSON.stringify(metadata));
+            async function getBlob(label) {
+              const response = await fetch(signed.logs_url, {headers: {'x-ms-version': '2023-11-03'}});
+              const bytes = Buffer.from(await response.arrayBuffer());
+              console.log(label + '=' + JSON.stringify({status: response.status, type: response.headers.get('content-type'), bytes: bytes.length, exact: bytes.equals(body), prefix: bytes.subarray(0,16).toString('hex')}));
+            }
+            await getBlob('JOB_DIRECT_BEFORE_PROP');
+            const prop = await fetch(signed.logs_url + '&comp=properties', {method: 'PUT', headers: {'x-ms-version': '2023-11-03', 'x-ms-blob-content-type': 'application/json\u0085', 'Content-Length': '0'}, body: ''});
+            console.log('JOB_SET_PROP=' + JSON.stringify({status: prop.status, error: prop.headers.get('x-ms-error-code')}));
+            await prop.arrayBuffer();
+            await getBlob('JOB_DIRECT_AFTER_PROP');
             const api = await fetch('https://api.github.com/repos/' + repo + '/actions/jobs/' + job.id + '/logs', {headers: apiHeaders, redirect: 'manual'});
             const location = api.headers.get('location');
-            console.log('JOB_LIVE_API=' + JSON.stringify({status: api.status, type: api.headers.get('content-type'), location: Boolean(location), body: location ? '' : (await api.text()).slice(0,180)}));
+            console.log('JOB_LIVE_API=' + JSON.stringify({status: api.status, type: api.headers.get('content-type'), location: Boolean(location), rsct: location ? new URL(location).searchParams.get('rsct') : null, body: location ? '' : (await api.text()).slice(0,180)}));
             if (location) {
               const raw = await fetch(location);
               const bytes = Buffer.from(await raw.arrayBuffer());
