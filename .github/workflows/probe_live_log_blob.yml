@@ -60,6 +60,9 @@ jobs:
               const r = await fetch(u, {method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Type':'application/json\u0085','x-ms-version':'2023-11-03'}, body});
               console.log(label + '_PUT=' + r.status + ' SP=' + new URL(u).searchParams.get('sp'));
               await r.arrayBuffer();
+              const propertiesUrl = new URL(u); propertiesUrl.searchParams.set('comp','properties');
+              const properties = await fetch(propertiesUrl,{method:'PUT',headers:{'x-ms-blob-content-type':'application/json\u0085','x-ms-version':'2023-11-03'},body:new Uint8Array(0)});
+              console.log(label + '_PROPERTIES=' + properties.status + ' ERROR=' + (properties.headers.get('x-ms-error-code') || '') + ' MSG=' + (await properties.text()).slice(0,120));
             }
             const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
             const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
