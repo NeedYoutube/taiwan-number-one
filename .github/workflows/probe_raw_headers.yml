@@ -1,0 +1,104 @@
+name: Repo Cassette artifact raw header probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compare artifact download header parsers
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const https = require('node:https');
+            const http2 = require('node:http2');
+            const repo = process.env.GITHUB_REPOSITORY;
+            const token = process.env.GITHUB_TOKEN;
+            const hex = value => Buffer.from(String(value), 'latin1').toString('hex');
+            const targets = [
+              ['v7_json_blob_nel', '12568691901'],
+              ['v4_zip_blob_nel', '12569935488']
+            ];
+
+            function h1(location) {
+              return new Promise((resolve, reject) => {
+                const request = https.request(location, {method: 'GET', timeout: 8000}, response => {
+                  const values = [];
+                  for (let i = 0; i < response.rawHeaders.length; i += 2) {
+                    if (response.rawHeaders[i].toLowerCase() === 'content-type') {
+                      values.push(hex(response.rawHeaders[i + 1]));
+                    }
+                  }
+                  const joined = response.headers['content-type'];
+                  const data = {status: response.statusCode, raw_ct_hex: values.join(',') || 'absent', parsed_ct_hex: joined ? hex(joined) : 'absent'};
+                  response.resume();
+                  response.on('end', () => resolve(data));
+                });
+                request.on('error', reject);
+                request.on('timeout', () => request.destroy(new Error('timeout')));
+                request.end();
+              });
+            }
+
+            function h2(location) {
+              return new Promise((resolve, reject) => {
+                const url = new URL(location);
+                const session = http2.connect(url.origin);
+                let settled = false;
+                const timer = setTimeout(() => finish(new Error('timeout')), 8000);
+                const finish = (error, result) => {
+                  if (settled) return;
+                  settled = true;
+                  clearTimeout(timer);
+                  session.close();
+                  if (error) reject(error); else resolve(result);
+                };
+                session.on('error', error => finish(error));
+                const request = session.request({':method': 'GET', ':path': url.pathname + url.search});
+                request.on('response', headers => {
+                  const value = headers['content-type'];
+                  const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+                  const data = {status: headers[':status'], ct_hex: values.map(hex).join(',') || 'absent'};
+                  request.resume();
+                  request.on('end', () => finish(null, data));
+                });
+                request.on('error', error => finish(error));
+                request.end();
+              });
+            }
+
+            for (const [label, id] of targets) {
+              const api = `https://api.github.com/repos/${repo}/actions/artifacts/${id}/zip`;
+              const first = await fetch(api, {
+                headers: {'Accept': 'application/vnd.github.v3+json', 'Authorization': `Bearer ${token}`},
+                redirect: 'manual'
+              });
+              if (first.status !== 302) {
+                core.info(`HEADER ${label} api_status=${first.status}`);
+                continue;
+              }
+              const location = first.headers.get('location');
+              if (!location) throw new Error('Redirect lacked Location');
+              const rsct = new URL(location).searchParams.get('rsct');
+              core.info(`HEADER ${label} rsct_utf8_hex=${rsct === null ? 'absent' : Buffer.from(rsct).toString('hex')}`);
+              try {
+                const result = await h1(location);
+                core.info(`HEADER ${label} http1=${JSON.stringify(result)}`);
+              } catch (error) { core.info(`HEADER ${label} http1_error=${String(error.message).slice(0, 100)}`); }
+              try {
+                const result = await h2(location);
+                core.info(`HEADER ${label} http2=${JSON.stringify(result)}`);
+              } catch (error) { core.info(`HEADER ${label} http2_error=${String(error.message).slice(0, 100)}`); }
+              try {
+                const response = await fetch(location);
+                const values = [...response.headers.entries()].filter(([key]) => key.toLowerCase() === 'content-type').map(([,value]) => hex(value));
+                core.info(`HEADER ${label} undici_status=${response.status} undici_ct_hex=${values.join(',') || 'absent'}`);
+                await response.arrayBuffer();
+              } catch (error) { core.info(`HEADER ${label} undici_error=${String(error.message).slice(0, 100)}`); }
+            }
