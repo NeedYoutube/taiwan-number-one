@@ -1,0 +1,57 @@
+name: Repo Cassette artifact format probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect legacy artifact download formats
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const artifactId = '12569935488';
+            const suffixes = [
+              ['zip', 'zip'],
+              ['raw', 'raw'],
+              ['file', 'file'],
+              ['blob', 'blob'],
+              ['none', 'none'],
+              ['uncompressed', 'uncompressed'],
+              ['json', 'json'],
+              ['tar', 'tar'],
+              ['zip_archive_false', 'zip?archive=false'],
+              ['zip_format_raw', 'zip?format=raw'],
+              ['zip_raw_1', 'zip?raw=1']
+            ];
+            const headers = {
+              'Accept': 'application/vnd.github.v3+json',
+              'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+            };
+            const hex = s => Buffer.from(s, 'utf8').toString('hex');
+            for (const [label, suffix] of suffixes) {
+              const endpoint = `https://api.github.com/repos/${repo}/actions/artifacts/${artifactId}/${suffix}`;
+              const first = await fetch(endpoint, {headers, redirect: 'manual'});
+              if (first.status !== 302) {
+                core.info(`FORMAT ${label} api_status=${first.status}`);
+                continue;
+              }
+              const location = first.headers.get('location');
+              if (!location) throw new Error(`${label} redirect lacked Location`);
+              const rsct = new URL(location).searchParams.getAll('rsct').map(hex).join(',') || 'absent';
+              let downloaded;
+              try { downloaded = await fetch(location); }
+              catch { core.info(`FORMAT ${label} download_error`); continue; }
+              const body = Buffer.from(await downloaded.arrayBuffer());
+              const type = downloaded.headers.get('content-type') || '';
+              let json = false;
+              try { JSON.parse(body.toString('utf8')); json = true; } catch {}
+              core.info(`FORMAT ${label} status=${downloaded.status} rsct_utf8_hex=${rsct} type_latin1_hex=${Buffer.from(type, 'latin1').toString('hex')} bytes=${body.length} body_is_json=${json}`);
+            }

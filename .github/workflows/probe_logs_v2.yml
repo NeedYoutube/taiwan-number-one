@@ -1,0 +1,61 @@
+name: Repo Cassette Actions log MIME probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect own completed job and step logs
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = '40117580824';
+            const headers = {
+              'Accept': 'application/vnd.github.v3+json',
+              'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`
+            };
+            const jobs = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, {headers});
+            if (!jobs.ok) throw new Error(`List jobs status=${jobs.status}`);
+            const document = await jobs.json();
+            const job = document.jobs?.[0];
+            if (!job) throw new Error('No job in completed probe run');
+            core.info(`JOB id=${job.id} steps=${job.steps?.length || 0}`);
+
+            async function inspect(label, endpoint) {
+              const first = await fetch(endpoint, {headers, redirect: 'manual'});
+              if (first.status !== 302) {
+                core.info(`LOG ${label} api_status=${first.status}`);
+                return;
+              }
+              const location = first.headers.get('location');
+              if (!location) throw new Error(`${label} redirect lacked Location`);
+              const rsct = new URL(location).searchParams.getAll('rsct')
+                .map(value => Buffer.from(value, 'utf8').toString('hex')).join(',') || 'absent';
+              let response;
+              try {
+                response = await fetch(location);
+              } catch {
+                core.info(`LOG ${label} download_error`);
+                return;
+              }
+              const body = Buffer.from(await response.arrayBuffer());
+              const type = response.headers.get('content-type') || '';
+              let isJson = false;
+              try { JSON.parse(body.toString('utf8')); isJson = true; } catch {}
+              core.info(`LOG ${label} status=${response.status} rsct_utf8_hex=${rsct} type_latin1_hex=${Buffer.from(type, 'latin1').toString('hex')} bytes=${body.length} body_is_json=${isJson}`);
+            }
+
+            const base = `https://api.github.com/repos/${repo}/actions/jobs/${job.id}`;
+            await inspect('job', `${base}/logs`);
+            const count = Math.min((job.steps?.length || 0) + 1, 8);
+            for (let n = 0; n < count; n++) {
+              await inspect(`step_${n}`, `${base}/steps/${n}/logs`);
+            }
