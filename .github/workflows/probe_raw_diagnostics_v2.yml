@@ -1,0 +1,78 @@
+name: Probe completed-job raw diagnostic routes
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  carrier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Create a completed job summary
+        run: printf 'Repo cassette route probe\n' >> "$GITHUB_STEP_SUMMARY"
+  probe:
+    needs: carrier
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Inspect route status and MIME without printing credentials or content
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const run = process.env.GITHUB_RUN_ID;
+            const headers = {
+              Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: 'application/vnd.github.v3+json',
+              'User-Agent': 'repo-cassette-route-probe',
+            };
+            const base = `https://api.github.com/repos/${repo}`;
+            const list = await fetch(`${base}/actions/runs/${run}/jobs?per_page=100`, {headers});
+            if (!list.ok) throw new Error(`Cannot list current run jobs: HTTP ${list.status}`);
+            const jobs = (await list.json()).jobs || [];
+            const job = jobs.find(x => x.name === 'carrier');
+            if (!job) throw new Error('Current job ID unavailable');
+            const id = job.id;
+            const routes = [
+              `actions/jobs/${id}/logs`,                    // documented control
+              `actions/jobs/${id}/summary_raw`,
+              `actions/jobs/${id}/summary`,
+              `actions/jobs/${id}/summary.md`,
+              `actions/jobs/${id}/summary.json`,
+              `actions/jobs/${id}/diagnostic-logs`,
+              `actions/jobs/${id}/diag-logs`,
+              `actions/jobs/${id}/diagnostics`,
+              `actions/jobs/${id}/logs/diagnostics`,
+              `actions/jobs/${id}/logs?type=diagnostic`,
+              `actions/jobs/${id}/steps/0/summary_raw`,
+              `actions/runs/${run}/summary_raw`,
+              `actions/runs/${run}/diagnostic-logs`,
+              `actions/runs/${run}/diag-logs`,
+              `actions/runs/${run}/diagnostics`,
+              `actions/runs/${run}/logs?type=diagnostic`,
+              `actions/runs/${run}/jobs/${id}/summary_raw`,
+            ];
+            for (const route of routes) {
+              try {
+                const response = await fetch(`${base}/${route}`, {headers, redirect: 'manual'});
+                const contentType = response.headers.get('content-type') || '';
+                const location = response.headers.get('location');
+                const target = location ? new URL(location).host : '';
+                let final = '';
+                if (location && response.status >= 300 && response.status < 400) {
+                  // The second request must not send the GitHub token to the blob host.
+                  const blob = await fetch(location, {headers: {Accept: headers.Accept}, redirect: 'follow'});
+                  const reader = blob.body?.getReader();
+                  const first = reader ? (await reader.read()).value || new Uint8Array() : new Uint8Array();
+                  await reader?.cancel();
+                  final = ` final=${blob.status} finalMime=${JSON.stringify(blob.headers.get('content-type'))} first8=${Buffer.from(first).subarray(0,8).toString('hex')}`;
+                }
+                console.log(`ROUTE ${route} status=${response.status} mime=${JSON.stringify(contentType)} redirectHost=${target}${final}`);
+                await response.body?.cancel();
+              } catch (error) {
+                console.log(`ROUTE ${route} error=${error.constructor.name}`);
+              }
+            }
