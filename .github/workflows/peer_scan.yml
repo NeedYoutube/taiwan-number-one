@@ -1,0 +1,78 @@
+name: Repo Cassette peer artifact MIME scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect all peer race artifacts
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const repo = 'yujeong050720/repo-cassette-private';
+            const run = '40107955599';
+            const htmlResponse = await fetch(`https://github.com/${repo}/actions/runs/${run}`);
+            if (!htmlResponse.ok) throw new Error(`Peer run HTML status=${htmlResponse.status}`);
+            const html = await htmlResponse.text();
+            const ids = [...new Set([...html.matchAll(/data-artifact-id="(\d+)"/g)].map(m => m[1]))];
+            core.info(`ARTIFACT_COUNT ${ids.length}`);
+            if (!ids.length) throw new Error('No peer artifact IDs in public run page');
+            const token = process.env.GITHUB_TOKEN;
+            const buckets = new Map();
+            let candidates = 0;
+
+            async function inspect(id) {
+              const endpoint = `https://api.github.com/repos/${repo}/actions/artifacts/${id}/zip`;
+              let response;
+              for (const auth of [null, `Bearer ${token}`]) {
+                const headers = {'Accept': 'application/vnd.github.v3+json'};
+                if (auth) headers.Authorization = auth;
+                response = await fetch(endpoint, {headers, redirect: 'manual'});
+                if (response.status === 302) break;
+              }
+              if (response.status !== 302) {
+                core.info(`ARTIFACT id=${id} api_status=${response.status}`);
+                return;
+              }
+              const location = response.headers.get('location');
+              if (!location) throw new Error(`Artifact ${id} lacked redirect Location`);
+              const rsct = new URL(location).searchParams.getAll('rsct')
+                .map(value => Buffer.from(value, 'utf8').toString('hex')).join(',') || 'absent';
+              let downloaded;
+              try {
+                downloaded = await fetch(location);
+              } catch {
+                core.info(`ARTIFACT id=${id} download_error`);
+                return;
+              }
+              const bytes = Buffer.from(await downloaded.arrayBuffer());
+              const type = downloaded.headers.get('content-type') || '';
+              const typeHex = Buffer.from(type, 'latin1').toString('hex');
+              const bucket = `${downloaded.status}:${typeHex}`;
+              buckets.set(bucket, (buckets.get(bucket) || 0) + 1);
+              let validPayload = false;
+              try {
+                const document = JSON.parse(bytes.toString('utf8'));
+                validPayload = document.full_name === `${repo}/actions/artifacts/${id}/zip`
+                  && String(document.owner?.avatar_url || '').startsWith('file:');
+              } catch {}
+              const media = type.split(',', 1)[0].split(';', 1)[0];
+              const jsMedia = media.trim().toLowerCase();
+              const pyMedia = media.replace(/^[\x09-\x0d\x1c-\x20\x85\xa0]+|[\x09-\x0d\x1c-\x20\x85\xa0]+$/g, '').toLowerCase();
+              const candidate = pyMedia === 'application/json'
+                && jsMedia !== 'application/json' && validPayload;
+              if (candidate) candidates++;
+              core.info(`ARTIFACT id=${id} status=${downloaded.status} rsct_utf8_hex=${rsct} type_latin1_hex=${typeHex} bytes=${bytes.length} valid_payload=${validPayload} candidate=${candidate}`);
+            }
+
+            for (let start = 0; start < ids.length; start += 8) {
+              await Promise.all(ids.slice(start, start + 8).map(inspect));
+            }
+            core.info(`SUMMARY candidates=${candidates} buckets=${JSON.stringify([...buckets.entries()])}`);
