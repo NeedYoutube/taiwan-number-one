@@ -101,6 +101,11 @@ jobs:
               const type = raw.headers.get('content-type') || '';
               const rsct = new URL(loc).searchParams.get('rsct');
               console.log(label + ' API=302 RAW=' + raw.status + ' RSCT=' + JSON.stringify(rsct) + ' MIME=' + JSON.stringify(type) + ' N=' + body.length + ' EXACT=' + body.equals(expected));
+              if (label === 'BASE') {
+                const variants = [['REPLACE_RSCT',u=>u.searchParams.set('rsct','application/json\u0085')],['REPLACE_RSCT_ASCII',u=>u.searchParams.set('rsct','application/json')],['ADD_RSCd',u=>u.searchParams.set('rscd','inline; filename=x.json')],['OLD_API',u=>u.searchParams.set('api-version','2012-02-12')]];
+                for (const [tag,mutate] of variants) { const u=new URL(loc); mutate(u); const v=await fetch(u,{redirect:'manual'}); const b=Buffer.from(await v.arrayBuffer()); console.log('SAS_' + tag + ' STATUS=' + v.status + ' MIME=' + JSON.stringify(v.headers.get('content-type')) + ' EXACT=' + b.equals(expected) + ' N=' + b.length); }
+                const duplicate = await fetch(loc + '&rsct=application%2Fjson%85',{redirect:'manual'}); const db=Buffer.from(await duplicate.arrayBuffer()); console.log('SAS_DUP_RSCT STATUS=' + duplicate.status + ' MIME=' + JSON.stringify(duplicate.headers.get('content-type')) + ' EXACT=' + db.equals(expected) + ' N=' + db.length);
+              }
             }
             const seedNumber = 2;
             const jobPath = 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs';
