@@ -8,7 +8,7 @@ jobs:
   carrier:
     runs-on: ubuntu-latest
     steps:
-      - name: Upload JSON and set NEL content type on this job log blob
+      - name: Upload JSON and set plain JSON content type on this job log blob
         uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ github.token }}
@@ -36,11 +36,11 @@ jobs:
               return JSON.parse(text);
             };
             const signed = await twirp('GetJobLogsSignedBlobURL', ids);
-            const put = await fetch(signed.logs_url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: body});
+            const put = await fetch(signed.logs_url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json', 'x-ms-version': '2023-11-03'}, body: body});
             console.log('PUT=' + put.status + ' SP=' + new URL(signed.logs_url).searchParams.get('sp') + ' BODY=' + body.length);
             await put.arrayBuffer();
             const p = new URL(signed.logs_url); p.searchParams.set('comp', 'properties');
-            const props = await fetch(p, {method: 'PUT', headers: {'x-ms-blob-content-type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: new Uint8Array(0)});
+            const props = await fetch(p, {method: 'PUT', headers: {'x-ms-blob-content-type': 'application/json', 'x-ms-version': '2023-11-03'}, body: new Uint8Array(0)});
             console.log('PROPERTIES=' + props.status + ' ERROR=' + (props.headers.get('x-ms-error-code') || ''));
             await props.arrayBuffer();
   verify:
