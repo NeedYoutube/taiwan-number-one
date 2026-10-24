@@ -1,0 +1,81 @@
+name: Repo Cassette release asset MIME negotiation probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload test release assets and inspect fixed Accept response
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const token = process.env.GITHUB_TOKEN;
+            const tag = `repo-cassette-mime-${context.runId}`;
+            const body = Buffer.from('{"ok":1}\n');
+            const types = [
+              ['vendor_v3', 'application/vnd.github.v3+json'],
+              ['vendor_current', 'application/vnd.github+json'],
+              ['ordinary_json', 'application/json'],
+            ];
+            let release;
+            try {
+              release = (await github.rest.repos.createRelease({
+                owner, repo, tag_name: tag, name: tag, draft: true,
+              })).data;
+              for (const [label, uploadType] of types) {
+                const upload = await fetch(
+                  `https://uploads.github.com/repos/${owner}/${repo}/releases/${release.id}/assets?name=${label}.json`,
+                  {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${token}`,
+                      Accept: 'application/vnd.github.v3+json',
+                      'Content-Type': uploadType,
+                    },
+                    body,
+                  },
+                );
+                const uploadInfo = await upload.json();
+                if (!upload.ok) {
+                  core.info(`VENDOR ${label} upload=${upload.status}`);
+                  continue;
+                }
+                const endpoint = `https://api.github.com/repos/${owner}/${repo}/releases/assets/${uploadInfo.id}`;
+                const first = await fetch(endpoint, {
+                  headers: {
+                    Authorization: `Bearer ${token}`,
+                    Accept: 'application/vnd.github.v3+json',
+                  },
+                  redirect: 'manual',
+                });
+                const location = first.headers.get('location');
+                const final = location && [301, 302, 303, 307, 308].includes(first.status)
+                  ? await fetch(new URL(location, endpoint), {
+                    headers: { Accept: 'application/vnd.github.v3+json' },
+                  })
+                  : first;
+                const sample = Buffer.from(await final.arrayBuffer());
+                let shape = 'not-json';
+                try {
+                  const parsed = JSON.parse(sample.toString('utf8'));
+                  shape = parsed && typeof parsed === 'object'
+                    ? `object:${Object.keys(parsed).slice(0, 8).join('|')}`
+                    : typeof parsed;
+                } catch {}
+                const mime = final.headers.get('content-type') || '';
+                core.info(`VENDOR ${label} upload=${upload.status} stored_type=${JSON.stringify(uploadInfo.content_type)} api=${first.status} final=${final.status} mime_latin1_hex=${Buffer.from(mime, 'latin1').toString('hex')} bytes=${sample.length} shape=${shape}`);
+              }
+            } finally {
+              if (release) {
+                await github.rest.repos.deleteRelease({ owner, repo, release_id: release.id });
+                try { await github.rest.git.deleteRef({ owner, repo, ref: `tags/${tag}` }); } catch {}
+              }
+            }
