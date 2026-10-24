@@ -5,6 +5,16 @@ permissions:
   actions: read
   contents: read
 jobs:
+  name_hash:
+    name: 'probe#api-version=2012-02-12&rsct=application/json'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe marker"
+  name_nel:
+    name: "probe\u0085json"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "probe marker"
   carrier:
     runs-on: ubuntu-latest
     timeout-minutes: 4
@@ -60,7 +70,7 @@ jobs:
               await put('STEP_LOG', 'GetStepLogsSignedBlobURL', {...ids,step_backend_id:stepBackend}, stepBody);
             }
   verify:
-    needs: carrier
+    needs: [carrier, name_hash, name_nel]
     runs-on: ubuntu-latest
     steps:
       - name: Read completed log endpoints
@@ -98,3 +108,10 @@ jobs:
             await inspect('BASE',logBase,jobBody);
             for (const [label,suffix] of [['RSCT_NEL','?rsct=application%2Fjson%85'],['RSCT_JSON','?rsct=application%2Fjson'],['RESPONSE_TYPE','?response-content-type=application%2Fjson%85'],['CONTENT_TYPE','?content-type=application%2Fjson%85'],['DOWNLOAD','?download=1']]) await inspect(label,logBase + suffix,jobBody);
             await inspect('STEP_LOG',api + '/actions/jobs/' + job.id + '/steps/' + seedNumber + '/logs',stepBody);
+            for (const candidate of jobs.filter(j => j.name.toLowerCase().startsWith('probe'))) {
+              const first = await fetch(api + '/actions/jobs/' + candidate.id + '/logs',{headers:gh,redirect:'manual'});
+              const loc = first.headers.get('location');
+              if (!loc) { console.log('JOB_NAME=' + JSON.stringify({name:candidate.name,status:first.status})); continue; }
+              const raw = await fetch(loc);
+              console.log('JOB_NAME=' + JSON.stringify({name:candidate.name,status:first.status,rsct:new URL(loc).searchParams.get('rsct'),rscd:new URL(loc).searchParams.get('rscd'),mime:raw.headers.get('content-type')}));
+            }
