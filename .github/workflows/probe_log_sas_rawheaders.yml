@@ -8,7 +8,7 @@ jobs:
   carrier:
     runs-on: ubuntu-latest
     steps:
-      - name: Upload JSON and set plain JSON content type on this job log blob
+      - name: Upload plain JSON then set raw U+001C content type on this job log blob
         uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,9 +40,26 @@ jobs:
             console.log('PUT=' + put.status + ' SP=' + new URL(signed.logs_url).searchParams.get('sp') + ' BODY=' + body.length);
             await put.arrayBuffer();
             const p = new URL(signed.logs_url); p.searchParams.set('comp', 'properties');
-            const props = await fetch(p, {method: 'PUT', headers: {'x-ms-blob-content-type': 'application/json', 'x-ms-version': '2023-11-03'}, body: new Uint8Array(0)});
-            console.log('PROPERTIES=' + props.status + ' ERROR=' + (props.headers.get('x-ms-error-code') || ''));
-            await props.arrayBuffer();
+            const tls = require('tls');
+            const props = await new Promise((resolve, reject) => {
+              const chunks = [];
+              const socket = tls.connect({host: p.hostname, port: 443, servername: p.hostname}, () => {
+                const request = 'PUT ' + p.pathname + p.search + ' HTTP/1.1\r\nHost: ' + p.host + '\r\nx-ms-version: 2023-11-03\r\nx-ms-blob-content-type: application/json' + String.fromCharCode(0x1c) + '\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+                socket.write(request, 'latin1');
+              });
+              socket.setTimeout(15000, () => socket.destroy(new Error('timeout')));
+              socket.on('data', chunk => chunks.push(chunk));
+              socket.on('error', reject);
+              socket.on('end', () => {
+                const raw = Buffer.concat(chunks).toString('latin1');
+                const split = raw.indexOf('\r\n\r\n');
+                const head = raw.slice(0, split);
+                const status = Number(head.match(/^HTTP\/1\.[01] (\d+)/)?.[1] || 0);
+                const error = head.match(/\r\nx-ms-error-code: ([^\r\n]+)/i)?.[1] || '';
+                resolve({status, headers: {get: name => name.toLowerCase() === 'x-ms-error-code' ? error : ''}});
+              });
+            });
+            console.log('PROPERTIES=' + props.status + ' ERROR=' + (props.headers.get('x-ms-error-code') || '') + ' SENT_TYPE_SUFFIX_HEX=1c');
   verify:
     needs: carrier
     runs-on: ubuntu-latest
