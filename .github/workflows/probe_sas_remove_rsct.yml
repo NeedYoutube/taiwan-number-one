@@ -1,0 +1,56 @@
+name: Probe artifact SAS response-type removal
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test whether rsct can be removed from artifact download SAS
+        uses: actions/github-script@v8
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          script: |
+            const {createHash} = require('node:crypto');
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            const resultsUrl = process.env.ACTIONS_RESULTS_URL;
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const scope = claims.scp.split(' ').find(s => s.startsWith('Actions.Results:'));
+            const [, workflow_run_backend_id, workflow_job_run_backend_id] = scope.split(':');
+            const rpcBase = new URL(resultsUrl).origin + '/twirp/github.actions.results.api.v1.ArtifactService/';
+            const ids = {workflow_run_backend_id, workflow_job_run_backend_id};
+            const rpc = async (method, data) => {
+              const response = await fetch(rpcBase + method, {method:'POST', headers:{Authorization:'Bearer ' + token, 'Content-Type':'application/json'}, body:JSON.stringify(data)});
+              return {status:response.status, data:await response.json()};
+            };
+            const name = 'remove-rsct-' + process.env.GITHUB_RUN_ID;
+            const payload = Buffer.from('{"probe":"remove-rsct"}');
+            const created = await rpc('CreateArtifact', {...ids, name, version:7, mime_type:'application/json'});
+            if (created.status !== 200 || created.data.ok !== true) throw new Error('CreateArtifact failed');
+            const uploadUrl = created.data.signed_upload_url || created.data.signedUploadUrl;
+            const upload = await fetch(uploadUrl, {method:'PUT', headers:{'x-ms-blob-type':'BlockBlob','x-ms-blob-content-type':'application/json\u0085','x-ms-version':'2023-11-03','Content-Type':'application/octet-stream'}, body:payload});
+            if (!upload.ok) throw new Error('Blob upload failed ' + upload.status);
+            const hash = 'sha256:' + createHash('sha256').update(payload).digest('hex');
+            const finalized = await rpc('FinalizeArtifact', {...ids, name, size:String(payload.length), hash});
+            if (finalized.status !== 200 || finalized.data.ok !== true) throw new Error('FinalizeArtifact failed');
+            const artifactId = finalized.data.artifact_id || finalized.data.artifactId;
+            const api = await fetch('https://api.github.com/repos/' + process.env.GITHUB_REPOSITORY + '/actions/artifacts/' + artifactId + '/zip', {headers:{Authorization:'Bearer ' + process.env.GITHUB_TOKEN, Accept:'application/vnd.github.v3+json'}, redirect:'manual'});
+            if (api.status !== 302) throw new Error('Artifact download API status ' + api.status);
+            const signed = api.headers.get('location');
+            const original = new URL(signed);
+            console.log('SAS original rsct=' + JSON.stringify(original.searchParams.get('rsct')));
+            const variants = [
+              ['baseline', signed],
+              ['remove_rsct', (() => { const u = new URL(signed); u.searchParams.delete('rsct'); return u.toString(); })()],
+              ['replace_rsct_nel', (() => { const u = new URL(signed); u.searchParams.set('rsct', 'application/json\u0085'); return u.toString(); })()],
+              ['response_content_type_nel', signed + '&response-content-type=application%2Fjson%85'],
+            ];
+            for (const [label, url] of variants) {
+              const response = await fetch(url, {redirect:'manual'});
+              const type = response.headers.get('content-type') || '';
+              console.log(label + ' status=' + response.status + ' typeHex=' + Buffer.from(type,'latin1').toString('hex') + ' error=' + (response.headers.get('x-ms-error-code') || ''));
+              await response.arrayBuffer();
+            }
